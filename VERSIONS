@@ -1,0 +1,72 @@
+# Pinned versions (verified native build, 2026-10-26; container rework 2026-10-27)
+
+Everything the flow uses, at the exact revisions validated on the host.
+The SoC sources arrive via the `baochip-1x` git submodule (mounted into the
+container at run time, not baked into the image).
+
+| Component | Source | Revision |
+|---|---|---|
+| baochip-1x (submodule `baochip-1x/`) | github.com/baochip/baochip-1x | 6d576b8ce44f3a9e50ba8440dbc5f6ea183f90a3 |
+| litex fork | github.com/buncram/litex (branch axi-verilog-cram) | ed2b52efce707f8aef6f93379f692ecec87b4d8d (baochip gitlink; installed from the mounted tree at container start) |
+| migen fork | github.com/buncram/migen | 991c796f804e258baa7a57c8d1307b927d51851d (baochip gitlink; tracer patch applied at container start, see patches/) |
+| verilog-axi fork | github.com/buncram/verilog-axi | cef527cca80841c2da8fe111a186a557767aebd1 (baochip gitlink) |
+| Verilator | github.com/verilator/verilator | v5.052 (built from source in the image; Ubuntu 24.04 apt has 5.020) |
+| pythondata-misc-tapcfg | litex-hub | a12c3f592c99f9c082fdc68c065b81cbd6e6b238 |
+| pythondata-software-compiler_rt | litex-hub | 6eb76609c9627bf26635e57c63fb22cda7115887 |
+| pythondata-software-picolibc | litex-hub | 6a13ccce7c575b32c102dd9dc52178505b81fe39 |
+| pythondata-cpu-vexriscv | litex-hub | 642ecfed1c84460555d6d803d660cc60cfc1ecb6 |
+| Python (in-image) | ubuntu:24.04 system | 3.12 |
+
+## Firmware (bundled default)
+
+`firmware/boot.bin` — prebuilt nto-tests test firmware
+(sha256 `5ec15e9a98a4adac2145386b4dc65204ada62b4123360c236be5aa80569b9b6e`,
+3155332 bytes), built from:
+
+| Component | Source | Revision |
+|---|---|---|
+| nto-tests | github.com/buncram/nto-tests | b2ef9e100f000725af4b9fe3aa94b610c370f6ba |
+| xous-core (build sibling) | github.com/betrusted-io/xous-core | 53d772438a9aeea88972b59b9707a88142b63548 |
+| rust | rustup, minimal | 1.90.0, target riscv32imac-unknown-none-elf |
+| xpack riscv-none-elf-gcc | xpack-dev-tools | 15.2.0-1 |
+
+Rebuild recipe (see README "Firmware"):
+
+```
+cargo xtask boot-image --no-default-features \
+    --feature fast-fclk --feature quirks-pll --feature aes-zkn \
+    --feature bio-mul --feature reset-value-tests --feature bio-tests
+python3 ./merge_cm7.py --rv32=rv32.bin --cm7=cm7/mbox.bin --out-file=boot.bin
+```
+
+`cm7/mbox.bin` is checked into nto-tests (no arm toolchain needed). The
+bundled image additionally carries a one-line sim early-quit hook in
+`tests/src/main.rs` (drives `finisher.v`'s quit input so the run ends at
+`$finish`); rebuilds without it simply run until `VEXSIM_TIMEOUT`.
+
+## Source patches (applied at container start; the submodule checkout stays
+## pristine except deps/migen/migen/fhdl/tracer.py, which is patched in place,
+## so `git -C baochip-1x status` there shows that one file as modified)
+
+- `patches/migen-tracer-py312.py` — upstream migen fix for Python 3.11+
+  bytecode tracing (`get_var_name` must skip CACHE/EXTENDED_ARG opcodes and
+  index STORE_DEREF against `co_nlocals`). Without it, Litex CSR auto-naming
+  dies on py3.12 with "Cannot extract CSR name from code".
+- `patches/veril-fst-close.cpp` — replacement for the Litex sim-core
+  `veril.cpp`: registers `litex_sim_tracer_close()` with `atexit` +
+  SIGINT/SIGTERM/SIGHUP so the FST/VCD writer emits its header, hierarchy,
+  geometry and seek tables (upstream never calls `Writer::close()`, leaving
+  traces that no reader can open after `$finish` or a timeout kill).
+- `patches/daric-svd-aoram-region.patch` — manual patch for firmware
+  rebuilds only: adds the AORAM memory region (0x50300000, 16 KiB; mirrors
+  `bao1x_peri.svd` in xous-core) to `baochip-1x/deps/nto-tests/svd/daric.svd`.
+  utralib's `build.rs` regenerates `generated.rs` from the SVDs on every
+  fresh checkout; the shipped SVDs omit AORAM, but `bao1x-hal` references
+  `utralib::HW_AORAM_MEM`. With the patch, generated output is byte-identical
+  to the native build's stale `generated.rs` (verified via md5).
+
+## Host packages validated (Ubuntu 24.04)
+
+build-essential autoconf automake flex bison m4 libfl-dev perl python3
+python3-venv python3-dev git curl ca-certificates time procps patch
+libevent-dev libjson-c-dev zlib1g-dev liblz4-dev

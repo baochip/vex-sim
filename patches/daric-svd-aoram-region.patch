@@ -1,0 +1,14 @@
+--- nto-tests/svd/daric.svd	2026-10-25 23:57:44.061368349 +0800
++++ nto-tests/svd/daric.svd	2026-10-26 03:38:55.139750034 +0800
+@@ -18066,6 +18066,11 @@
+                 <baseAddress>0x5012C000</baseAddress>
+                 <size>0x00001000</size>
+             </memoryRegion>
++            <memoryRegion>
++                <name>AORAM</name>
++                <baseAddress>0x50300000</baseAddress>
++                <size>0x00004000</size>
++            </memoryRegion>
+         </memoryRegions>
+         <constants>
+         </constants>

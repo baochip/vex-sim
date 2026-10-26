@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Convenience wrapper for the vex-sim container. Works with podman (preferred,
+# rootless) or docker.
+#
+# Layout: the image is toolchain-only. The baochip-1x submodule tree is
+# bind-mounted read-write at /opt/baochip-1x and the Verilator model is built
+# INTO it (baochip-1x/verilate/build/...), so model caches persist across
+# runs and live with your checkout.
+#
+#   ./container-run                  # build image if missing, then sim
+#   ./container-run --rebuild        # rebuild the container image first
+#   ./container-run --build-only     # just (re)build the image
+#   ./container-run --view bao_udma.py   # select SoC definition:
+#                                    #   bao_soc.py (default) | bao_udma.py | bao_sce.py
+#   ./container-run sim              # build model if needed, then run it
+#   ./container-run build            # only (re)build the Verilator model
+#   ./container-run bios             # run with out/boot.bin (fast firmware
+#                                    # swap; no re-verification)
+#   ./container-run bash             # shell in the image
+#
+# Waveforms + console log land in ./out (sim.fst, console.log).
+#
+# Env passthrough: VEXSIM_TIMEOUT, VEXSIM_BIOS, VEXSIM_THREADS, VEXSIM_JOBS,
+# VEXSIM_CPUS, VEXSIM_VIEW.
+# VEXSIM_BUILD_ISOLATION=chroot works around rootless podman setups that lack
+# a systemd user session (runc cannot create cgroup scopes).
+set -euo pipefail
+cd "$(dirname "$0")"
+
+IMAGE=vex-sim
+REMOTE_IMAGE=ghcr.io/YOURORG/vex-sim:latest   # set once published
+BAOCHIP="$PWD/baochip-1x"
+
+ENGINE="${CONTAINER_ENGINE:-}"
+if [ -z "$ENGINE" ]; then
+    if   command -v podman >/dev/null 2>&1; then ENGINE=podman
+    elif command -v docker >/dev/null 2>&1; then ENGINE=docker
+    else echo "error: neither podman nor docker found on PATH" >&2; exit 1; fi
+fi
+
+REBUILD=0; BUILD_ONLY=0; MODE="sim"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -b|--rebuild)  REBUILD=1 ;;
+        --build-only)  REBUILD=1; BUILD_ONLY=1 ;;
+        --view)        VEXSIM_VIEW="$2"; shift ;;
+        --view=*)      VEXSIM_VIEW="${1#--view=}" ;;
+        -h|--help)     sed -n '2,27p' "$0"; exit 0 ;;
+        sim|build|bios|bash)  MODE="$1" ;;
+        *)             echo "unknown argument: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# The sim builds + runs from the submodule tree; fail early with instructions.
+if [ ! -f "$BAOCHIP/verilate/bao_soc.py" ]; then
+    echo "error: ./baochip-1x not populated. Fetch the submodule with:" >&2
+    echo "       git submodule update --init --recursive" >&2
+    exit 1
+fi
+if [ ! -e "$BAOCHIP/deps/migen/setup.py" ]; then
+    echo "error: baochip-1x submodule deps not initialized. From ./baochip-1x:" >&2
+    echo "       git submodule update --init --recursive" >&2
+    exit 1
+fi
+
+build_image() {
+    local flags=()
+    # podman doesn't cache layers as eagerly as docker; make it explicit.
+    [ "$ENGINE" = podman ] && flags+=(--layers)
+    [ -n "${VEXSIM_BUILD_ISOLATION:-}" ] && flags+=(--isolation="$VEXSIM_BUILD_ISOLATION")
+    "$ENGINE" build "${flags[@]}" -t "$IMAGE" .
+}
+
+if [ "$MODE" = bios ] && [ ! -f "$PWD/out/boot.bin" ]; then
+    echo "error: out/boot.bin not found - build your firmware and place it there" >&2
+    echo "       (see README 'Firmware'); the image default stays with './container-run sim'" >&2
+    exit 1
+fi
+if [ "$MODE" = bios ] && [ -z "${VEXSIM_BIOS:-}" ]; then
+    VEXSIM_BIOS=/work/boot.bin
+fi
+
+if [ "$REBUILD" = 1 ]; then
+    build_image
+elif ! "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo ">> image '$IMAGE' not found locally - pulling from $REMOTE_IMAGE"
+    if "$ENGINE" pull "$REMOTE_IMAGE" 2>/dev/null; then
+        "$ENGINE" tag "$REMOTE_IMAGE" "$IMAGE"
+    else
+        echo ">> pull failed, falling back to local build"
+        build_image
+    fi
+else
+    echo ">> reusing image '$IMAGE' (use --rebuild after editing the Dockerfile)"
+fi
+
+[ "$BUILD_ONLY" = 1 ] && exit 0
+
+# Output dir for sim.fst / console.log; created if missing.
+OUTDIR="$PWD/out"; mkdir -p "$OUTDIR"
+
+RUNFLAGS=( --rm
+    -v "$OUTDIR:/work"
+    -v "$BAOCHIP:/opt/baochip-1x" )
+# docker runs as root by default; use the host uid so outputs (out/ AND the
+# model cache inside the mounted baochip-1x tree) aren't root-owned. The
+# mounted tree must be user-writable for build modes; rootless podman maps
+# container root to your uid already.
+if [ "$ENGINE" = docker ]; then
+    RUNFLAGS+=( --user "$(id -u):$(id -g)" )
+fi
+# Allow capping the sim's CPU usage.
+[ -n "${VEXSIM_CPUS:-}" ] && RUNFLAGS+=( --cpus "$VEXSIM_CPUS" )
+# Pass through runtime knobs.
+for v in VEXSIM_TIMEOUT VEXSIM_BIOS VEXSIM_THREADS VEXSIM_JOBS VEXSIM_VIEW \
+         VEXSIM_TRACE_START VEXSIM_TRACE_END; do
+    [ -n "${!v:-}" ] && RUNFLAGS+=( -e "$v=${!v}" )
+done
+
+exec "$ENGINE" run "${RUNFLAGS[@]}" "$IMAGE" "$MODE"

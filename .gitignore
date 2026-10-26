@@ -1,0 +1,4 @@
+out/
+*.fst
+*.vcd
+__pycache__/
