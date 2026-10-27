@@ -26,7 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # flow is verified against (fstcpp FST writer etc.).
 ARG VERILATOR_VER=5.052
 RUN curl -fsSL "https://github.com/verilator/verilator/archive/refs/tags/v${VERILATOR_VER}.tar.gz" \
-      -o /tmp/v.tgz && mkdir -p /opt/vsrc && tar xzf /tmp/v.tgz -C /opt/vsrc && \
+      -o /tmp/v.tgz && mkdir -p /opt/vsrc && \
+    python3 -c "import tarfile; tarfile.open('/tmp/v.tgz').extractall('/opt/vsrc', filter='data')" && \
     cd /opt/vsrc/verilator-${VERILATOR_VER} && \
     autoconf && ./configure --prefix=/opt/verilator && \
     make -j"$(nproc)" && make install && rm -rf /tmp/v.tgz /opt/vsrc
