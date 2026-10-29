@@ -36,6 +36,35 @@ MODE="${1:-sim}"
 [ $# -gt 0 ] && shift
 EXTRA_ARGS=("$@")
 
+# Startup transparency: every stage announces itself with a wall-clock stamp
+# so slow steps (pip installs, verilation, trace copies) are never silent.
+# VEXSIM_DEBUG=1 additionally enables `set -x` command tracing.
+if [ "${VEXSIM_DEBUG:-0}" = 1 ]; then set -x; fi
+log() { echo ">> [$(date +%H:%M:%S)] $*"; }
+
+# --- abort handling ------------------------------------------------------------
+# Ctrl+C from an interactive `container-run` arrives as SIGINT (the wrapper
+# attaches a TTY so the engine forwards it); `podman stop` / `docker stop`
+# arrive as SIGTERM. Vsim is built with the FST-close patch: SIGINT/SIGTERM
+# sets an in-model quit flag, the main loop breaks, atexit() closes the
+# trace writer (header/hierarchy/seek tables), so the waveform from the
+# aborted run is still perfectly readable. We ask for that first, then nudge
+# any stuck Litex python / verilation so the pipeline can unwind and the
+# trace copy in run_sim() still executes.
+ABORTED=0
+abort() {
+    if [ "$ABORTED" = 1 ]; then exit 130; fi   # second Ctrl+C: leave now
+    ABORTED=1
+    echo ""
+    echo ">> abort requested - stopping (partial waveform still saved)"
+    pkill -INT -x Vsim 2>/dev/null || true
+    pkill -INT -f 'bao_soc.py|bao_core.py' 2>/dev/null || true
+    pkill -x verilate 2>/dev/null || true
+    pkill -x make 2>/dev/null || true
+    return 0
+}
+trap abort INT TERM
+
 # --- view selection ----------------------------------------------------------
 VIEW="${VEXSIM_VIEW:-bao_soc.py}"
 VIEW="${VIEW#./}"
@@ -64,18 +93,40 @@ check_src() {
     fi
 }
 
-# prep: make the mounted tree usable with the image toolchain. Idempotent;
-# runs once per container invocation before any build/run.
+# prep: make the toolchain + mounted tree consistent before any build/run.
+# The litex+migen stack is BAKED into the image at the pinned gitlink revs,
+# so the common path is a fast sanity check, not a per-launch reinstall.
+# VEXSIM_FORCE_PREP=1 reinstalls litex+migen from the mounted submodule fork
+# (dev flow: editing the Litex/migen forks and iterating without an image
+# rebuild). The veril.cpp tracer patch + VexRiscv symlink are re-applied
+# every run (cheap, keeps the mounted tree authoritative for the sim core).
 prep() {
     check_src
-    # migen py3.12 tracer fix (CSR auto-naming dies without it on py>=3.11).
-    # The submodule checkout is pristine; overwrite is identity when patched.
-    if ! cmp -s "$PATCHDIR/migen-tracer-py312.py" "$SRC/deps/migen/migen/fhdl/tracer.py"; then
+    if [ "${VEXSIM_FORCE_PREP:-0}" = 1 ]; then
+        log "prep: FORCE_PREP - reinstalling litex+migen from mounted fork (offline)..."
+        # py3.12 tracer fix first (CSR auto-naming dies without it on py>=3.11).
         cp "$PATCHDIR/migen-tracer-py312.py" "$SRC/deps/migen/migen/fhdl/tracer.py"
+        /opt/venv/bin/pip install -q --no-index --no-build-isolation --no-deps \
+            "$SRC/deps/migen" "$SRC/deps/litex"
+        log "prep: litex+migen reinstalled from mounted fork"
+    else
+        [ -e /opt/venv/.vexsim-prep-ok ] || {
+            echo "error: baked litex stack missing in image; rebuild it (./container-run --rebuild)" >&2
+            echo "       or set VEXSIM_FORCE_PREP=1 to install from the mounted submodule." >&2; exit 1; }
+        log "prep: using image-baked litex+migen"
     fi
-    # litex + migen from the mounted fork (offline: venv already has all deps).
-    /opt/venv/bin/pip install -q --no-index --no-build-isolation --no-deps \
-        "$SRC/deps/migen" "$SRC/deps/litex"
+    # Golden core complex: the SoC build (and even `bao_soc.py --svd-only`)
+    # reads build/gateware/cram_axi.v, so make sure it exists for every mode
+    # before any python runs. build/ is a cache, never source: overwriting
+    # with the golden rev is deterministic. VEXSIM_BUILD_CORE=1 defers to
+    # build_model, which regenerates via bao_core.py instead.
+    if [ "${VEXSIM_BUILD_CORE:-0}" != 1 ] && [ -f /opt/vexsim-golden/cram_axi.v ]; then
+        if ! cmp -s /opt/vexsim-golden/cram_axi.v "$VERILATE/build/gateware/cram_axi.v"; then
+            mkdir -p "$VERILATE/build/gateware"
+            install -m 0644 /opt/vexsim-golden/cram_axi.v "$VERILATE/build/gateware/cram_axi.v"
+            log "prep: installed golden core complex cram_axi.v"
+        fi
+    fi
     # litex's sim-core tracer (veril.cpp) never closes the FST/VCD writer:
     # header/hierarchy/seek tables are only emitted at close(), so a run
     # ended by $finish or a timeout kill leaves an unparseable trace. Our
@@ -89,6 +140,14 @@ prep() {
 }
 
 # build_model: core complex + SoC + Verilator compile into MODELDIR.
+#
+# The core complex (cram_axi.v) is FIXED SILICON for this flow's audience
+# (firmware developers), so it ships in the image as a golden artifact
+# (/opt/vexsim-golden/cram_axi.v, sha256 in VERSIONS) and bao_core.py is NOT
+# run. That skips a multi-minute migen/Litex generation step that can never
+# produce a different answer. VEXSIM_BUILD_CORE=1 regenerates it from the
+# mounted tree (core-complex development flow).
+#
 # Litex auto-runs Vsim at the end of a successful build; there is no TTY
 # in build mode, so kill Vsim the moment it starts -- Litex swallows that
 # failure (`except: pass`) and python exits cleanly. The real simulation
@@ -96,11 +155,21 @@ prep() {
 build_model() {
     cd "$VERILATE"
     mkdir -p build/gateware build/software
-    echo ">> building core complex (bao_core.py)"
-    python3 ./bao_core.py
-    echo ">> building SoC defs ($VIEW ${VIEW_ARGS[*]:-})"
+    if [ "${VEXSIM_BUILD_CORE:-0}" = 1 ]; then
+        log "building core complex from source (bao_core.py)"
+        python3 ./bao_core.py
+    else
+        if [ ! -f /opt/vexsim-golden/cram_axi.v ]; then
+            echo "error: golden core complex missing in image; rebuild it" >&2
+            echo "       (./container-run --rebuild) or set VEXSIM_BUILD_CORE=1" >&2
+            exit 1
+        fi
+        install -m 0644 /opt/vexsim-golden/cram_axi.v build/gateware/cram_axi.v
+        log "core complex: golden cram_axi.v (VEXSIM_BUILD_CORE=1 to regenerate)"
+    fi
+    log "building SoC defs ($VIEW ${VIEW_ARGS[*]:-})"
     python3 ./bao_soc.py --svd-only --vextype vexi "${VIEW_ARGS[@]}"
-    echo ">> verinating + compiling model for view $VIEW_TAG (BIOS=$BIOS)"
+    log "verinating + compiling model for view $VIEW_TAG (BIOS=$BIOS)"
     ( timeout 6h python3 ./bao_soc.py --vextype vexi --speed normal \
         "${VIEW_ARGS[@]}" \
         --bios "$BIOS" --boot-offset 0x000000 \
@@ -120,7 +189,7 @@ build_model() {
     rm -rf "$MODELDIR"
     mkdir -p "$(dirname "$MODELDIR")"
     cp -al build/sim/gateware "$MODELDIR" 2>/dev/null || cp -a build/sim/gateware "$MODELDIR"
-    echo ">> model ready in $MODELDIR"
+    log "model ready in $MODELDIR"
 }
 
 run_sim() {
@@ -137,19 +206,28 @@ run_sim() {
     ln -s "$GW/obj_dir" "$RUNDIR/obj_dir"
     cd "$RUNDIR"
     rm -f sim.fst
-    echo ">> running simulation (console output below; wall-clock cap ${TIMEOUT_SECS}s)"
+    log "running simulation (console output below; wall-clock cap ${TIMEOUT_SECS}s)"
+    echo ">> Ctrl+C aborts; the waveform is still closed + saved"
     # `script -qec` gives Vsim a pty so its $display output is line-buffered:
     # without it console.log only fills in 4 KiB blocks and looks frozen, and
     # a timeout kill would lose the buffer. stdin /dev/null keeps Litex
     # modules off the tty; TTY input isn't needed.
-    timeout "$TIMEOUT_SECS" script -qec './obj_dir/Vsim < /dev/null' /dev/null 2>&1 | tee "$WORK/console.log" || true
+    # Backgrounded so the INT/TERM trap runs *during* the run (bash defers
+    # traps around foreground children, and with job control off the pipeline
+    # shares our process group): abort() SIGINTs Vsim directly, the patched
+    # trace handler closes the FST, then the trace copy below still runs.
+    # script's own stdin is /dev/null: with `podman run -t` an open attach
+    # stream makes script hang after Vsim exits (it drains stdin to EOF).
+    timeout "$TIMEOUT_SECS" script -qec './obj_dir/Vsim < /dev/null' /dev/null < /dev/null 2>&1 | tee "$WORK/console.log" & SIMPID=$!
+    wait "$SIMPID" 2>/dev/null || true
+    wait "$SIMPID" 2>/dev/null || true   # 1st wait returns early on abort; 2nd reaps
     if [ -f sim.fst ]; then
         cp -f sim.fst "$WORK/sim.fst"
-        echo ">> waveform written to $WORK/sim.fst ($(du -h "$WORK/sim.fst" | cut -f1))"
+        log "waveform written to $WORK/sim.fst ($(du -h "$WORK/sim.fst" | cut -f1))"
     fi
     if [ -f "$WORK/console.log" ]; then
         n=$(grep -c '\[duart\]' "$WORK/console.log" || true)
-        echo ">> duart console lines captured: $n"
+        log "duart console lines captured: $n"
     fi
     rm -rf "$RUNDIR"
 }
@@ -158,6 +236,7 @@ case "$MODE" in
     sim)
         prep
         run_sim
+        if [ "$ABORTED" = 1 ]; then exit 130; fi
         ;;
     build)
         prep
@@ -175,11 +254,12 @@ case "$MODE" in
             exit 1
         fi
         cd "$VERILATE"
-        echo ">> regenerating boot-memory init from $BIOS"
+        log "regenerating boot-memory init from $BIOS"
         python3 ./bao_soc.py --svd-only --vextype vexi "${VIEW_ARGS[@]}" --bios "$BIOS"
         mkdir -p "$MODELDIR"
         cp -f build/gateware/reram_mem.init "$MODELDIR/reram_mem.init"
         run_sim
+        if [ "$ABORTED" = 1 ]; then exit 130; fi
         ;;
     bash|sh)
         exec "$MODE"

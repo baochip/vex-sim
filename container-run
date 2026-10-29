@@ -16,12 +16,14 @@
 #   ./container-run build            # only (re)build the Verilator model
 #   ./container-run bios             # run with out/boot.bin (fast firmware
 #                                    # swap; no re-verification)
+#   ./container-run bios myfw.bin    # ...or any firmware file on the host
+#   ./container-run --bios myfw.bin  # same; path form composes with --view
 #   ./container-run bash             # shell in the image
 #
 # Waveforms + console log land in ./out (sim.fst, console.log).
 #
 # Env passthrough: VEXSIM_TIMEOUT, VEXSIM_BIOS, VEXSIM_THREADS, VEXSIM_JOBS,
-# VEXSIM_CPUS, VEXSIM_VIEW.
+# VEXSIM_CPUS, VEXSIM_VIEW, VEXSIM_DEBUG (=1: trace every startup step).
 # VEXSIM_BUILD_ISOLATION=chroot works around rootless podman setups that lack
 # a systemd user session (runc cannot create cgroup scopes).
 set -euo pipefail
@@ -38,19 +40,36 @@ if [ -z "$ENGINE" ]; then
     else echo "error: neither podman nor docker found on PATH" >&2; exit 1; fi
 fi
 
-REBUILD=0; BUILD_ONLY=0; MODE="sim"
+REBUILD=0; BUILD_ONLY=0; MODE="sim"; BIOS_FILE=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -b|--rebuild)  REBUILD=1 ;;
         --build-only)  REBUILD=1; BUILD_ONLY=1 ;;
         --view)        VEXSIM_VIEW="$2"; shift ;;
         --view=*)      VEXSIM_VIEW="${1#--view=}" ;;
-        -h|--help)     sed -n '2,27p' "$0"; exit 0 ;;
-        sim|build|bios|bash)  MODE="$1" ;;
+        --bios)        BIOS_FILE="$2"; shift ;;
+        --bios=*)      BIOS_FILE="${1#--bios=}" ;;
+        -h|--help)     sed -n "2,28p" "$0"; exit 0 ;;
+        bios)
+            MODE=bios
+            # optional positional: firmware image for this run
+            if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then
+                BIOS_FILE="$2"; shift
+            fi ;;
+        sim|build|bash)  MODE="$1" ;;
+        /*|*/*|*.bin)   # bare path anywhere = firmware image (bios mode)
+                        [ -z "$BIOS_FILE" ] || { echo "error: firmware already set: '$BIOS_FILE' (got '$1')" >&2; exit 1; }
+                        BIOS_FILE="$1" ;;
         *)             echo "unknown argument: $1" >&2; exit 1 ;;
     esac
     shift
 done
+# --bios without an explicit mode implies bios mode
+if [ -n "$BIOS_FILE" ] && [ "$MODE" = sim ]; then MODE=bios; fi
+if [ -n "$BIOS_FILE" ] && [ "$MODE" != bios ]; then
+    echo "error: --bios/firmware path only applies to bios mode (got '$MODE')" >&2
+    exit 1
+fi
 
 # The sim builds + runs from the submodule tree; fail early with instructions.
 if [ ! -f "$BAOCHIP/verilate/bao_soc.py" ]; then
@@ -72,30 +91,53 @@ build_image() {
     "$ENGINE" build "${flags[@]}" -t "$IMAGE" .
 }
 
-if [ "$MODE" = bios ] && [ ! -f "$PWD/out/boot.bin" ]; then
-    echo "error: out/boot.bin not found - build your firmware and place it there" >&2
-    echo "       (see README 'Firmware'); the image default stays with './container-run sim'" >&2
-    exit 1
-fi
-if [ "$MODE" = bios ] && [ -z "${VEXSIM_BIOS:-}" ]; then
-    VEXSIM_BIOS=/work/boot.bin
+if [ "$MODE" = bios ]; then
+    mkdir -p "$PWD/out"
+    if [ -z "${VEXSIM_BIOS:-}" ]; then
+        if [ -n "$BIOS_FILE" ]; then
+            [ -f "$BIOS_FILE" ] || { echo "error: firmware file '$BIOS_FILE' not found" >&2; exit 1; }
+            # Only ./out is bind-mounted at /work, so stage the image there.
+            # A file at ./out/<name> is used in place (no pointless copy).
+            case "$(realpath "$BIOS_FILE")" in
+                "$PWD/out/"*) VEXSIM_BIOS="/work/$(basename "$BIOS_FILE")" ;;
+                *)            stage="$(basename "$BIOS_FILE")"
+                              cp -f "$BIOS_FILE" "$PWD/out/$stage"
+                              VEXSIM_BIOS="/work/$stage" ;;
+            esac
+        elif [ -f "$PWD/out/boot.bin" ]; then
+            VEXSIM_BIOS=/work/boot.bin
+        else
+            echo "error: no firmware: give a path (./container-run bios myfw.bin)" >&2
+            echo "       or drop one at out/boot.bin; the image default stays with './container-run sim'" >&2
+            exit 1
+        fi
+    fi
 fi
 
 if [ "$REBUILD" = 1 ]; then
     build_image
 elif ! "$ENGINE" image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo ">> image '$IMAGE' not found locally - pulling from $REMOTE_IMAGE"
-    if "$ENGINE" pull "$REMOTE_IMAGE" 2>/dev/null; then
-        "$ENGINE" tag "$REMOTE_IMAGE" "$IMAGE"
-    else
-        echo ">> pull failed, falling back to local build"
+    # Skip the pull when REMOTE_IMAGE is still the publish-me placeholder:
+    # against a real registry this silently eats 1-2 min of retry timeouts
+    # before falling back to a local build.
+    if [[ "$REMOTE_IMAGE" == *YOURORG* ]]; then
+        echo ">> image '$IMAGE' not found locally and no REMOTE_IMAGE published - building (first build ~10 min: verilator toolchain)"
         build_image
+    else
+        echo ">> image '$IMAGE' not found locally - pulling from $REMOTE_IMAGE"
+        if "$ENGINE" pull "$REMOTE_IMAGE" 2>/dev/null; then
+            "$ENGINE" tag "$REMOTE_IMAGE" "$IMAGE"
+        else
+            echo ">> pull failed, falling back to local build"
+            build_image
+        fi
     fi
 else
     echo ">> reusing image '$IMAGE' (use --rebuild after editing the Dockerfile)"
 fi
 
 [ "$BUILD_ONLY" = 1 ] && exit 0
+echo ">> $(date +%T) starting container ($ENGINE)"
 
 # Output dir for sim.fst / console.log; created if missing.
 OUTDIR="$PWD/out"; mkdir -p "$OUTDIR"
@@ -103,6 +145,17 @@ OUTDIR="$PWD/out"; mkdir -p "$OUTDIR"
 RUNFLAGS=( --rm
     -v "$OUTDIR:/work"
     -v "$BAOCHIP:/opt/baochip-1x" )
+# The toolchain prep is offline (pip --no-index) and the sim never needs
+# net; skipping rootless network setup (pasta/slirp4netns) removes a
+# multi-second-to-multi-minute silent startup stall on some hosts.
+# VEXSIM_NETWORK=slirp (or bridge, host, ...) re-enables it.
+RUNFLAGS+=( --network="${VEXSIM_NETWORK:-none}" )
+# Ctrl+C: do NOT add `-t`. With `-t` but no `-i`, podman leaves the client
+# terminal half-attached (echo off, input un-consumed: keystrokes queue and
+# replay into the shell afterwards) and output appears to buffer. In plain
+# non-TTY mode the engine's sig-proxy (on by default) forwards the terminal's
+# SIGINT to the container's entrypoint, which traps it and stops the model
+# cleanly (waveform still closed + copied to out/). Second Ctrl+C exits now.
 # docker runs as root by default; use the host uid so outputs (out/ AND the
 # model cache inside the mounted baochip-1x tree) aren't root-owned. The
 # mounted tree must be user-writable for build modes; rootless podman maps
@@ -114,7 +167,8 @@ fi
 [ -n "${VEXSIM_CPUS:-}" ] && RUNFLAGS+=( --cpus "$VEXSIM_CPUS" )
 # Pass through runtime knobs.
 for v in VEXSIM_TIMEOUT VEXSIM_BIOS VEXSIM_THREADS VEXSIM_JOBS VEXSIM_VIEW \
-         VEXSIM_TRACE_START VEXSIM_TRACE_END; do
+         VEXSIM_TRACE_START VEXSIM_TRACE_END VEXSIM_DEBUG \
+         VEXSIM_FORCE_PREP VEXSIM_BUILD_CORE; do
     [ -n "${!v:-}" ] && RUNFLAGS+=( -e "$v=${!v}" )
 done
 
