@@ -127,6 +127,13 @@ prep() {
             log "prep: installed golden core complex cram_axi.v"
         fi
     fi
+
+    # Litex writes csr_svd here, and bao_soc.py/bao_sce.py copy RTL + init
+    # artifacts into build/sim/gateware *before* the Builder creates it —
+    # a cold tree (bios mode runs bao_soc.py before any model build) dies
+    # with FileNotFoundError. build/ is a cache; creating it early is free.
+    mkdir -p "$VERILATE/build/software" "$VERILATE/build/sim/gateware"
+
     # litex's sim-core tracer (veril.cpp) never closes the FST/VCD writer:
     # header/hierarchy/seek tables are only emitted at close(), so a run
     # ended by $finish or a timeout kill leaves an unparseable trace. Our
