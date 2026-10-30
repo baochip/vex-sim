@@ -1,4 +1,4 @@
 [submodule "baochip-1x"]
 	path = baochip-1x
 	url = https://github.com/baochip/baochip-1x.git
-	branch = main
+	branch = oss-sim
