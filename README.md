@@ -1,14 +1,18 @@
 # vex-sim
 
 Containerized [Verilator](https://verilator.org/) simulation of the
-baochip-1x **"bao" SoC** (VexRiscv "vexi" core, Litex fabric) running the
-**nto-tests** bare-metal test firmware. Produces an FST waveform (`sim.fst`)
-and captures the simulated DUAL UART console to `console.log` — with nothing
-to install on the host except podman or docker.
+baochip-1x **"bao" SoC**. Produces an FST waveform (`sim.fst`)
+and captures the simulated DUART console to `console.log`.
 
-Modeled on the [bio-sim](../bio-sim) container strategy: the toolchain lives
-in the image, your workspace is mounted at runtime, and waveforms are
-ordinary files.
+Because the Baochip-1x is a large SoC, simulation models are broken up
+into "views" of the chip. A view of the chip only contains the peripherals
+relevant to a subsystem of interest. For example, an SCE simulation would
+only include the SCE peripherals, but not the BIO. This is done to speed
+up the simulation and also keep the waveform files manageable. Unused signals
+are still simulated, polluting the waveform browser and simulation output
+files.
+
+See below for details on how to use `--view` to select a simulation view.
 
 ## Quick start
 
@@ -26,14 +30,13 @@ Outputs land in `./out/`:
 - `sim.fst` — full waveform (open with `gtkwave sim.fst`, or any FST viewer)
 - `console.log` — captured `[duart]` console output from the firmware
 
-The simulation is compute-bound (~5 CPU cores). The firmware boots, runs the
-reset-value + bio test suites, then signals `finisher.v` to end the run
-early; the whole sim takes seconds once the model exists. The waveform cap
-is `VEXSIM_TIMEOUT` wall-clock seconds (default 1800) — the FST closes
-cleanly either way (header/hierarchy/seek tables are written at exit).
-Ctrl+C during a run aborts it the same clean way: the model stops, and the
+The simulation runs the firmware in `firmware/boot.bin` by default; a custom
+firmware can be specified via the `--bios` argument. Simulation terminates
+when `finisher.v` is signalled, or `VEXSIM_TIMEOUT` is reached.
+
+Ctrl+C during a run should abort cleanly: the model stops, and the
 partial waveform is still closed and saved to `out/sim.fst` (exit 130).
-A second Ctrl+C leaves immediately.
+A second Ctrl+C leaves immediately, leaving `out/sim.fst` in a corrupt state.
 
 ## Layout
 
@@ -52,13 +55,13 @@ vex-sim/
 
 The image carries the **fixed toolchain**: Verilator 5.052 (source build),
 the Litex stack (migen + litex at the pinned baochip gitlink revs, tracer
-fix applied) installed into a venv from git, and the **golden core complex**
-(`cram_axi.v`, generated once by `bao_core.py` from the pinned RTL). The
-SoC "views" — the part you iterate on — are NOT baked: the `baochip-1x`
-submodule tree is bind-mounted read-write at `/opt/baochip-1x`, and the
-Verilator model builds INTO that tree (per-view cache under
-`verilate/build/sim-<view>/`). Consequences:
+fix applied) installed into a venv from git, and the **core complex**
+(`cram_axi.v`, pulled in from the tape-out RTL). The
+SoC "views" are NOT baked: the `baochip-1x` submodule tree is bind-mounted
+read-write at `/opt/baochip-1x`, and the Verilator model builds INTO that
+tree (per-view cache under `verilate/build/sim-<view>/`).
 
+As a result, the simulation behaves as follows as files are changed:
 - edit any SoC-level RTL / build script under `baochip-1x/` and rerun — no
   image rebuild; the model build re-verilates automatically,
 - the model cache (`baochip-1x/verilate/build/`) survives between runs and
@@ -70,26 +73,6 @@ Verilator model builds INTO that tree (per-view cache under
   mounted `deps/` forks (editing the forks without image rebuilds);
   `VEXSIM_BUILD_CORE=1` regenerates `cram_axi.v` from the mounted RTL tree.
 
-## How it works
-
-```
-container-run ──podman run -v ./out:/work -v ./baochip-1x:/opt/baochip-1x──▶ entrypoint
-   prep: use image-baked litex/migen; install golden cram_axi.v;
-         re-apply veril.cpp patch; VexRiscv symlink
-   build (only if the model for this view is missing or `build` mode):
-     cram_axi.v (golden) ; bao_soc.py → sim.v + Verilator obj_dir/Vsim
-   run:  obj_dir/Vsim  ├─ stdout ─▶ /work/console.log
-                        └─ sim.fst ─▶ /work/sim.fst
-```
-
-Exact tool revisions in `VERSIONS`. Two patches make the flow work (see
-`patches/`, never committed to the submodule): a migen bytecode-tracer fix
-for Python 3.12, baked into the image's migen at build time; and a
-replacement litex `veril.cpp` that closes the FST writer via `atexit` +
-SIGTERM/SIGINT/SIGHUP, re-applied to the venv at every container start —
-upstream never calls `Writer::close()`, so wave files would lack their
-header/hierarchy/seek tables after `$finish` or a timeout kill.
-
 ## Views (SoC definition)
 
 `--view` selects which SoC definition builds the model (each view caches its
@@ -97,25 +80,14 @@ own model under `verilate/build/sim-<view>/`):
 
 | `--view` | builds | status |
 |---|---|---|
-| `bao_soc.py` (default) | main bao SoC | working |
-| `bao_udma.py` | UDMA variant (`bao_soc.py --udma`) | **broken upstream**: `deps/soc_oss/udma_adapter.py` copies `./soc_oss/rtl/common/io_interface_def_v0.1.sv`, a tree not present in the pinned checkout (upstream `verilate.sh` notes udma is "once that's debugged and working again") |
-| `bao_sce.py` | SCE/crypto variant (`bao_soc.py --sce`) | working (needs the `soc_oss` open-source bus bridges + the `ahbs()` interface-instance fix, both in the pinned tree) |
+| `bao_soc.py` (default) | main bao SoC + BIO | working |
+| `bao_sce.py` | SCE/crypto variant (`bao_soc.py --sce`) | working |
+| `bao_udma.py` | UDMA variant (`bao_soc.py --udma`) |**WIP** - needs further porting from the full SOC environment to the OSS environment. Not ready for use yet. |
 
-The sce view originally failed in two ways: it pulled closed Arm
-CMSDK models from `/opt/cram-nto` (not redistributable), and once those
-were replaced by the in-tree `oss_*` bridge re-implementations, Verilator
-aborted with `Wire inputs its own output, creating circular logic (wire
-x=x)` on `sceahbif.haddr`. Root cause: `deps/soc_oss/sce_adapter.sv`
-declared `ahbif #(...) ahbs;` — a parenless interface-typed *variable*
-(illegal SystemVerilog; IEEE 2632.2-2003 requires an instantiation).
-V3Const inlines the pass-through `ahb_thru` onto that variable and the
-slave-side pin `ahbslave.haddr` resolves onto the master's own signal.
-Fix: `ahbif #(...) ahbs();` (an instance). Same latent bug fixed
-proactively in `deps/soc_oss/soc_ifsub_udma.sv`.
 
 ```sh
 ./container-run --view bao_sce.py build    # build + run the SCE model
-./container-run --view bao_udma.py build   # attempt the udma model
+./container-run --view bao_sce.py --bios ../xous-core/target/riscv32imac-unknown-none-elf/release/primordial.img # Example path to a pre-built binary. Binary loaded at 0x6000_0000, and execution starts there.
 ```
 
 ## Options
@@ -145,34 +117,16 @@ VEXSIM_TIMEOUT=600 ./container-run
 
 ## Firmware
 
-The image bundles a prebuilt nto-tests `boot.bin`
-(`firmware/boot.bin`, sha256 in `VERSIONS`) including a sim early-quit hook
-so runs end at `$finish` in seconds. To run your own firmware, build it
+The image bundles a prebuilt `boot.bin` that performs a "smoke test" on
+the build, including a sim early-quit hook so runs end at `$finish` in
+seconds. To run your own firmware, build it
 (anywhere with rust + riscv-none-elf binutils; the submodule has the
 sources):
-
-```sh
-cd baochip-1x/deps/nto-tests          # or a clone at the pinned rev
-cargo xtask boot-image --no-default-features \
-    --feature fast-fclk --feature quirks-pll --feature aes-zkn \
-    --feature bio-mul --feature reset-value-tests --feature bio-tests
-python3 ./merge_cm7.py --rv32=rv32.bin --cm7=cm7/mbox.bin --out-file=boot.bin
-cp boot.bin ../../../out/boot.bin
-cd ../../.. && ./container-run bios   # ~2 min: regenerates boot-memory init,
-                                      # reuses the cached model (no re-verify)
-```
-
-Or skip the `cp` and name the image directly — any host path works (it is
-staged into `out/` for the mount), and it composes with `--view`:
 
 ```sh
 ./container-run bios /path/to/boot.bin
 ./container-run --bios /path/to/boot.bin --view bao_sce.py
 ```
-
-(`baochip-1x/deps/nto-tests` ships SVDs missing the AORAM region that
-utralib's build.rs needs; apply `patches/daric-svd-aoram-region.patch`
-before building. Not needed for the bundled image.)
 
 ## Native (no container)
 
@@ -199,3 +153,17 @@ cd baochip-1x/verilate
   simulation itself never touches the network.
 - The DUT is the full SoC; a full trace is large (15 MB after early quit;
   multi-GB at the 1800 s timeout). `VEXSIM_TRACE_START/END` trim the window.
+
+## Implementation Notes
+
+Exact tool revisions in `VERSIONS`. Two patches make the flow work (see
+`patches/`, never committed to the submodule): a migen bytecode-tracer fix
+for Python 3.12, baked into the image's migen at build time; and a
+replacement litex `veril.cpp` that closes the FST writer via `atexit` +
+SIGTERM/SIGINT/SIGHUP, re-applied to the venv at every container start -
+upstream never calls `Writer::close()`, so wave files would lack their
+header/hierarchy/seek tables after `$finish` or a timeout kill.
+
+# AI Usage Notice
+
+This container was generated with the help of qwen3.8-flash-next-unsloth-ud-iq4_xs + omp harness
