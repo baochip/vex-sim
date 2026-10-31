@@ -54,6 +54,7 @@ vex-sim/
 |   +-- verilate/       #   Litex build scripts (bao_soc.py, bao_core.py, ...)
 |   +-- verilate/build/ #   model cache — persists here across runs
 +-- golden/cram_axi.v   # golden core complex (fixed silicon; baked into image)
++-- lib/netlist/        # redacted gate-level VexRiscv netlist view (--netlist)
 +-- firmware/boot.bin   # bundled default firmware (prebuilt nto-tests image)
 +-- out/                # sim.fst, console.log, your own boot.bin
 +-- patches/            # runtime patches (migen tracer py3.12, FST-close veril.cpp)
@@ -67,7 +68,10 @@ fix applied) installed into a venv from git, and the **core complex**
 (`cram_axi.v`, pulled in from the tape-out RTL). The
 SoC "views" are NOT baked: the `baochip-1x` submodule tree is bind-mounted
 read-write at `/opt/baochip-1x`, and the Verilator model builds INTO that
-tree (per-view cache under `verilate/build/sim-<view>/`).
+tree (per-view cache under `verilate/build/sim-<view>/`). The core variant
+(RTL vs `--netlist`) is part of the cache key: `sim-<view>-netlist/`, so
+switching variants triggers exactly one re-verification and each variant
+then stays cached (flipping back rebuilds once again).
 
 As a result, the simulation behaves as follows as files are changed:
 - edit any SoC-level RTL / build script under `baochip-1x/` and rerun — no
@@ -95,14 +99,58 @@ own model under `verilate/build/sim-<view>/`):
 
 ```sh
 ./container-run --view bao_sce.py build    # build + run the SCE model
-./container-run --view bao_sce.py --bios ../xous-core/target/riscv32imac-unknown-none-elf/release/primordial.img # Example path to a pre-built binary. Binary loaded at 0x6000_0000, and execution starts there.
+./container-run --view bao_sce.py --bios out/fw-hash.bin   # SCE KAT image
 ```
+
+Firmware must match the view's peripheral map (images are linked for a
+topology): the SCE view keeps only duart/sce/testbench, so run SCE KAT
+images there (e.g. `out/fw-hash.bin`: `~~Primordial up!~~` → `sce_hash`
+KATs). Full-chip images (`xous-core`, etc.) need
+the default view; on the SCE view they may fault on a missing peripheral and
+reset-loop (`hello world!` / `booting... 001`) forever.
+
+## Core view: RTL vs redacted netlist (`--netlist`)
+
+By default the CPU core complex (`cram_axi`) simulates from the
+tape-out **RTL** (golden `cram_axi.v`). `--netlist` swaps the core for the
+redacted **gate-level netlist**: the taped-out VexRiscv complex minus the
+CM7 (absent from this hierarchy), standard cells replaced by behavioral RTL
+models, RAM macros by open-source behavioral models:
+
+```sh
+./container-run --netlist            # build + run the netlist-core model
+```
+
+All netlist-view files live in [`lib/netlist/`](lib/netlist/) (open-source /
+redistributed-safe; regenerate the wrapper with
+`lib/netlist/README.md`'s command). The netlist top carries exactly the
+golden core's 156 scalar ports via a generated wrapper, so the SoC build
+(`sim.v`) is bit-identical between views; only the core implementation
+changes. The model cache is keyed per variant (`sim-<view>-netlist/`), so
+RTL ⇄ netlist switches re-verify exactly once each, in every view
+(`bao_sce.py` / `bao_udma.py` included).
+
+Each cached model carries a `.vexsim-core` provenance stamp; a model verilated
+from the other core (or predating the stamp) is rebuilt automatically.
+
+Notes:
+- Waveforms: only the **core subtree** is obfuscated (`cram_axi` internals
+  = `_*`/`U*_` nets, `CLKCELL_BUF*` cells, `_*_1kx32` RAM macros); the
+  surrounding SoC (crossbars, duart, sce, ...) keeps its structured RTL names.
+- `bios` mode (firmware swap) works in both views (same flow: init-file
+  swap into the matching cached model dir).
+- Gate-level sim runs much slower than the RTL model. You may need to raise
+  `VEXSIM_TIMEOUT` for long firmware runs.
+- The netlist's `test_*`/scan/DFT inputs are tied off; `stov`-style test
+  modes are unreachable (the silicon ties them with TIEL cells).
 
 ## Options
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `VEXSIM_VIEW` | `bao_soc.py` | SoC definition (see table) |
+| `VEXSIM_NETLIST` | — | `1` (= `--netlist`): simulate the redacted gate-level core from `lib/netlist/` instead of RTL; model cache is keyed per core variant |
+| `VEXSIM_NETLIST_DIR` | `/opt/vexsim-lib/netlist` | netlist staging dir inside the container (override for host/native runs: point at your `vex-sim/lib/netlist`) |
 | `VEXSIM_TIMEOUT` | `1800` | wall-clock cap (s) on the simulation run |
 | `VEXSIM_BIOS` | `/opt/firmware/boot.bin` | firmware image (`bios` mode) |
 | `VEXSIM_THREADS` | `5` | Verilator `--threads` (model build) |
