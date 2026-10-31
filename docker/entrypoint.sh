@@ -21,6 +21,12 @@
 #   bao_sce.py             SCE variant           -> bao_soc.py --sce
 # bao_udma.py / bao_sce.py are module-only (no __main__); bao_soc.py
 # dispatches to them via --udma / --sce, so the view name maps to a flag.
+#
+# Core variant (VEXSIM_NETLIST): =1 simulates the redacted gate-level
+# VexRiscv core from lib/netlist (mounted at /opt/vexsim-lib/netlist)
+# instead of the RTL cram_axi.v. The Verilator model cache dir is keyed on
+# the variant (build/sim-<view>[-netlist]/gateware), so switching variants
+# rebuilds once and each variant stays cached independently.
 set -euo pipefail
 
 SRC="${VEXSIM_SRC:-/opt/baochip-1x}"
@@ -75,6 +81,14 @@ case "$VIEW" in
     *) echo "error: unknown view '$VIEW' (bao_soc.py|bao_udma.py|bao_sce.py)" >&2; exit 1 ;;
 esac
 VIEW_TAG=soc; [ "$VIEW" = bao_udma.py ] && VIEW_TAG=udma; [ "$VIEW" = bao_sce.py ] && VIEW_TAG=sce
+# Core variant: RTL (default) vs redacted gate-level netlist. The model cache
+# dir is keyed on it, so flipping --netlist rebuilds the Verilator model once
+# and each variant stays cached independently afterwards.
+export VEXSIM_NETLIST="${VEXSIM_NETLIST:-0}"
+if [ "$VEXSIM_NETLIST" != 0 ]; then
+    VIEW_TAG="$VIEW_TAG-netlist"
+    export VEXSIM_NETLIST_DIR="${VEXSIM_NETLIST_DIR:-/opt/vexsim-lib/netlist}"
+fi
 MODELDIR="$VERILATE/build/sim-$VIEW_TAG/gateware"
 
 PATCHDIR=/opt/vexsim-patches
@@ -119,8 +133,22 @@ prep() {
     # reads build/gateware/cram_axi.v, so make sure it exists for every mode
     # before any python runs. build/ is a cache, never source: overwriting
     # with the golden rev is deterministic. VEXSIM_BUILD_CORE=1 defers to
-    # build_model, which regenerates via bao_core.py instead.
-    if [ "${VEXSIM_BUILD_CORE:-0}" != 1 ] && [ -f /opt/vexsim-golden/cram_axi.v ]; then
+    # build_model, which regenerates via bao_core.py instead. In netlist mode
+    # the RTL core complex isn't compiled at all, so skip it and check the
+    # netlist staging dir instead.
+    if [ "$VEXSIM_NETLIST" != 0 ]; then
+        [ -d "$VEXSIM_NETLIST_DIR" ] || {
+            echo "error: --netlist but no netlist dir at $VEXSIM_NETLIST_DIR" >&2
+            echo "       (expected vex-sim lib/netlist staged; container-run" >&2
+            echo "        mounts ./lib at /opt/vexsim-lib in --netlist mode)." >&2; exit 1; }
+        for f in vex-redacted-clean.v stdcells_rtl.v mbdff.v \
+                 rdram1kx32.v rdram128x22.v rdram512x64.v \
+                 cram_axi_netlist_wrapper.v; do
+            [ -f "$VEXSIM_NETLIST_DIR/$f" ] || {
+                echo "error: --netlist missing $f in $VEXSIM_NETLIST_DIR" >&2; exit 1; }
+        done
+        log "netlist core: $VEXSIM_NETLIST_DIR"
+    elif [ "${VEXSIM_BUILD_CORE:-0}" != 1 ] && [ -f /opt/vexsim-golden/cram_axi.v ]; then
         if ! cmp -s /opt/vexsim-golden/cram_axi.v "$VERILATE/build/gateware/cram_axi.v"; then
             mkdir -p "$VERILATE/build/gateware"
             install -m 0644 /opt/vexsim-golden/cram_axi.v "$VERILATE/build/gateware/cram_axi.v"
@@ -162,7 +190,9 @@ prep() {
 build_model() {
     cd "$VERILATE"
     mkdir -p build/gateware build/software
-    if [ "${VEXSIM_BUILD_CORE:-0}" = 1 ]; then
+    if [ "$VEXSIM_NETLIST" != 0 ]; then
+        log "core complex: redacted netlist ($VEXSIM_NETLIST_DIR)"
+    elif [ "${VEXSIM_BUILD_CORE:-0}" = 1 ]; then
         log "building core complex from source (bao_core.py)"
         python3 ./bao_core.py
     else
@@ -196,6 +226,10 @@ build_model() {
     rm -rf "$MODELDIR"
     mkdir -p "$(dirname "$MODELDIR")"
     cp -al build/sim/gateware "$MODELDIR" 2>/dev/null || cp -a build/sim/gateware "$MODELDIR"
+    # provenance stamp: which core variant this model was verilated from;
+    # run_sim rebuilds on mismatch (protects against caches made before the
+    # model dir was keyed per variant)
+    if [ "$VEXSIM_NETLIST" != 0 ]; then echo netlist > "$MODELDIR/.vexsim-core"; else echo rtl > "$MODELDIR/.vexsim-core"; fi
     log "model ready in $MODELDIR"
 }
 
@@ -204,6 +238,17 @@ run_sim() {
     if [ ! -x "$GW/obj_dir/Vsim" ]; then
         echo "error: no model for view $VIEW_TAG; building it now"
         build_model
+    else
+        # Core-variant provenance: rebuild if the cached model was verilated
+        # from the other core (RTL vs netlist). Models built before this key
+        # existed have no stamp -> treated as stale, rebuilt once.
+        local core_want=rtl core_have
+        [ "$VEXSIM_NETLIST" != 0 ] && core_want=netlist
+        core_have=$(cat "$GW/.vexsim-core" 2>/dev/null || echo missing)
+        if [ "$core_have" != "$core_want" ]; then
+            log "cached $VIEW_TAG model has core '$core_have', requested '$core_want' - rebuilding"
+            build_model
+        fi
     fi
     # Run from a writable scratch dir so the trace never races the mount;
     # obj_dir is symlinked (binary is self-contained), the small files
