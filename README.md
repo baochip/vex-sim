@@ -1,7 +1,7 @@
 # vex-sim
 
 Containerized [Verilator](https://verilator.org/) simulation of the
-baochip-1x **"bao" SoC**. Produces an FST waveform (`sim.fst`)
+Baochip-1x SOC. Produces an FST waveform (`sim.fst`)
 and captures the simulated DUART console to `console.log`.
 
 Because the Baochip-1x is a large SoC, simulation models are broken up
